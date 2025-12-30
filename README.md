@@ -7,7 +7,7 @@ Explore the dataset [here](https://india-export-import.pages.dev).
 ## Data
 
 * [export-import.parquet](https://github.com/Vonter/india-export-import/releases/latest/download/export-import.parquet): Commodity export and import activity in India as Parquet file.
-* [export-import.csv.gz](https://github.com/Vonter/india-export-import/releases/latest/download/export-import.csv.gz): Commodity export and import activity in India as compressed CSV file.
+* [export-import.csv.zip](https://github.com/Vonter/india-export-import/releases/latest/download/export-import.csv.zip): Commodity export and import activity in India as compressed CSV file.
 
 For more details, refer to the [DATA.md](DATA.md).
 
