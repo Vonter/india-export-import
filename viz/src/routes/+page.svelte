@@ -112,7 +112,7 @@
 		}
 		if (params.has('year')) {
 			const urlYear = parseInt(params.get('year') || '2025', 10);
-			if (!isNaN(urlYear) && urlYear >= 2003 && urlYear <= 2025) {
+			if (!isNaN(urlYear) && urlYear >= 2003 && urlYear <= 2026) {
 				year = urlYear;
 			}
 		}
@@ -340,8 +340,8 @@
 		{ value: 'Port', label: 'Port' }
 	];
 
-	// Generate year options (2003 to 2025)
-	const yearOptions = Array.from({ length: 2025 - 2003 + 1 }, (_, i) => 2003 + i)
+	// Generate year options (2003 to 2026)
+	const yearOptions = Array.from({ length: 2026 - 2003 + 1 }, (_, i) => 2003 + i)
 		.reverse()
 		.map((y) => ({ value: y, label: y.toString() }));
 
