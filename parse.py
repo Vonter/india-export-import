@@ -6,419 +6,272 @@ Uses Polars for high-performance data processing with parallel processing for op
 """
 
 import logging
+import traceback
 import zipfile
-import polars as pl
-import pandas as pd
-from pathlib import Path
 from io import BytesIO
 from multiprocessing import Pool, cpu_count
-from functools import partial
+from pathlib import Path
+
+import pandas as pd
+import polars as pl
 from tqdm import tqdm
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger(__name__)
 
+# Keys used to keep the combined dataset sorted on disk
+SORT_KEYS = ['Commodity', 'Country', 'Port', 'Year', 'Month', 'Type']
+
+# Excel file magic numbers -> pandas engine
+EXCEL_SIGNATURES = {
+    b'PK': 'openpyxl',                              # xlsx (ZIP)
+    b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1': 'xlrd',    # xls (OLE2)
+}
+
+
+def get_latest_parquet_month(parquet_path):
+    """Return the most recent (year, month) in the dataset, or None if absent."""
+    if not parquet_path.exists():
+        return None
+    row = (
+        pl.scan_parquet(parquet_path)
+        .select('Year', 'Month')
+        .sort('Year', 'Month')
+        .last()
+        .collect()
+    )
+    return int(row['Year'][0]), int(row['Month'][0])
+
 
 def find_column_indices(header_row):
-    """
-    Find column indices from header row.
-    
-    Args:
-        header_row: List of header values
-    
-    Returns:
-        dict: Column indices for commodity, country, port, unit, qty, inr, usd
-    """
-    indices = {
-        'commodity': None,
-        'country': None,
-        'port': None,
-        'unit': None,
-        'qty': None,
-        'inr': None,
-        'usd': None
-    }
-    
+    """Map logical columns to their index in the header row."""
+    indices = dict.fromkeys(['commodity', 'country', 'port', 'unit', 'qty', 'inr', 'usd'])
+
+    def match(val):
+        v = val.upper()
+        if 'COMMODITY' in v:
+            return 'commodity'
+        if 'COUNTRY' in v:
+            return 'country'
+        if 'PORT' in v:
+            return 'port'
+        if v == 'UNIT':
+            return 'unit'
+        if v == 'QTY':
+            return 'qty'
+        if 'INR' in v:
+            return 'inr'
+        if 'US $' in v or 'USD' in v or 'VALUE(US' in v:
+            return 'usd'
+        return None
+
     for idx, val in enumerate(header_row):
-        if val is not None and isinstance(val, str):
-            val_upper = val.upper()
-            if 'COMMODITY' in val_upper and indices['commodity'] is None:
-                indices['commodity'] = idx
-            elif 'COUNTRY' in val_upper and indices['country'] is None:
-                indices['country'] = idx
-            elif 'PORT' in val_upper and indices['port'] is None:
-                indices['port'] = idx
-            elif val_upper == 'UNIT' and indices['unit'] is None:
-                indices['unit'] = idx
-            elif val_upper == 'QTY' and indices['qty'] is None:
-                indices['qty'] = idx
-            elif 'INR' in val_upper or 'VALUE(INR)' in val_upper:
-                if indices['inr'] is None:
-                    indices['inr'] = idx
-            elif 'US $' in val_upper or 'USD' in val_upper or 'VALUE(US' in val_upper:
-                if indices['usd'] is None:
-                    indices['usd'] = idx
-    
+        if isinstance(val, str):
+            key = match(val)
+            if key and indices[key] is None:
+                indices[key] = idx
+
     return indices
 
 
-def parse_numeric_series(series):
-    """Vectorized parsing of numeric values from a pandas Series."""
-    return pd.to_numeric(series, errors='coerce')
-
-
-def detect_excel_format(xls_data):
-    """
-    Detect Excel file format from file header bytes.
-    
-    Args:
-        xls_data: Bytes content of the Excel file
-    
-    Returns:
-        str: 'xlsx' or 'xls' or None if unknown
-    """
-    if len(xls_data) < 8:
-        return None
-    
-    # XLSX files start with PK (ZIP signature)
-    if xls_data[:2] == b'PK':
-        return 'xlsx'
-    # XLS files start with specific OLE2 signature
-    elif xls_data[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
-        return 'xls'
-    return None
-
-
-def parse_xls_file(xls_data, year, month, data_type='import'):
-    """
-    Parse a single XLS file and return a Polars DataFrame using vectorized operations.
-    Handles both .xls (old format) and .xlsx (new format) files.
-    
-    Args:
-        xls_data: Bytes content of the XLS file
-        year: Year of the data
-        month: Month of the data
-        data_type: 'import' or 'export'
-    
-    Returns:
-        Polars DataFrame with parsed data
-    """
+def read_excel(xls_data):
+    """Read an Excel workbook (xls or xlsx) as raw strings, with engine fallback."""
+    engine = next((e for sig, e in EXCEL_SIGNATURES.items() if xls_data.startswith(sig)), None)
+    kwargs = dict(
+        io=BytesIO(xls_data),
+        header=None,
+        dtype=str,
+        na_values=['', 'N/A', 'n/a', 'NULL', 'null'],
+        keep_default_na=False,
+    )
     try:
-        # Detect file format and choose appropriate engine
-        file_format = detect_excel_format(xls_data)
-        
-        # Try to read with appropriate engine, fallback to auto-detect
-        read_kwargs = {
-            'io': BytesIO(xls_data),
-            'header': None,
-            'dtype': str,
-            'na_values': ['', 'N/A', 'n/a', 'NULL', 'null'],
-            'keep_default_na': False
-        }
-        
-        # Set engine based on detected format
-        if file_format == 'xlsx':
-            read_kwargs['engine'] = 'openpyxl'
-        elif file_format == 'xls':
-            # Use xlrd engine for .xls files (requires xlrd<2.0)
-            # Check if xlrd is available
-            try:
-                import xlrd
-                read_kwargs['engine'] = 'xlrd'
-            except ImportError:
-                logger.warning("xlrd not available for .xls files. Install with: pip install 'xlrd<2.0'")
-                # Will try auto-detect below
-        # If format is unknown, let pandas auto-detect (no engine specified)
-        
-        # Read Excel with optimized pandas settings
-        # Try with detected engine first, fallback to auto-detect on error
-        try:
-            df_pandas = pd.read_excel(**read_kwargs)
-        except Exception as e:
-            # If engine-specific read fails, try without specifying engine (auto-detect)
-            if 'engine' in read_kwargs:
-                logger.debug(f"Failed to read with {read_kwargs.get('engine', 'unknown')} engine, trying auto-detect: {e}")
-                read_kwargs.pop('engine', None)
-                try:
-                    df_pandas = pd.read_excel(**read_kwargs)
-                except Exception as e2:
-                    logger.error(f"Failed to read Excel file with auto-detect: {e2}")
-                    raise
-            else:
-                raise
-        
-        if df_pandas.empty or len(df_pandas) < 2:
+        return pd.read_excel(engine=engine, **kwargs)
+    except Exception as e:
+        if engine is None:
+            raise
+        logger.debug(f"Failed to read with {engine} engine, trying auto-detect: {e}")
+        return pd.read_excel(**kwargs)
+
+
+def parse_xls_file(xls_data, year, month, data_type):
+    """Parse a single XLS/XLSX file into a Polars DataFrame using vectorized operations."""
+    try:
+        df = read_excel(xls_data)
+        if len(df) < 2:
             return pl.DataFrame()
-        
-        # Row 0 is the title, Row 1 contains the actual column headers
-        header_row = df_pandas.iloc[1].tolist()
-        indices = find_column_indices(header_row)
-        
-        # Check essential columns
+
+        # Row 0 is the title, row 1 the column headers; data starts at row 2
+        indices = find_column_indices(df.iloc[1].tolist())
         if indices['commodity'] is None or indices['country'] is None:
-            logger.warning(f"Could not find essential columns. Found: commodity={indices['commodity']}, country={indices['country']}")
+            logger.warning(
+                f"Could not find essential columns. Found: "
+                f"commodity={indices['commodity']}, country={indices['country']}"
+            )
             return pl.DataFrame()
-        
-        # Extract data starting from row 2 (skip title row 0 and header row 1)
-        data_df = df_pandas.iloc[2:].copy()
-        
-        if data_df.empty:
+
+        data = df.iloc[2:].copy()
+        if data.empty:
             return pl.DataFrame()
-        
-        # Vectorized extraction of columns
-        # Find maximum column index needed
-        valid_indices = [i for i in indices.values() if i is not None]
-        if valid_indices:
-            max_col = max(valid_indices)
-            if max_col >= len(data_df.columns):
-                # Pad columns if needed
-                for i in range(len(data_df.columns), max_col + 1):
-                    data_df[i] = None
-        
-        # Extract commodity column and filter valid rows
-        commodity_col = data_df.iloc[:, indices['commodity']].astype(str).str.strip()
-        valid_mask = (
-            commodity_col.notna() & 
-            (commodity_col != '') & 
-            (~commodity_col.str.upper().isin(['COMMODITY', 'NAN', 'NONE', '']))
-        )
-        
-        if not valid_mask.any():
+
+        # Pad columns so every referenced index exists
+        max_col = max(i for i in indices.values() if i is not None)
+        for i in range(len(data.columns), max_col + 1):
+            data[i] = None
+
+        commodity = data.iloc[:, indices['commodity']].astype(str).str.strip()
+        valid = commodity.notna() & ~commodity.str.upper().isin(['COMMODITY', 'NAN', 'NONE', ''])
+        if not valid.any():
             return pl.DataFrame()
-        
-        data_df = data_df[valid_mask].copy()
-        commodity_col = commodity_col[valid_mask]
-        
-        # Vectorized extraction of string columns
-        def safe_str_extract(col_idx, default=''):
-            if col_idx is None:
-                return pd.Series([default] * len(data_df), index=data_df.index)
-            col = data_df.iloc[:, col_idx].astype(str).str.strip()
-            # Replace 'nan' strings (from pandas conversion) with default
-            col = col.replace('nan', default)
+        data, commodity = data[valid], commodity[valid]
+
+        def text(key, default=''):
+            if indices[key] is None:
+                return default
+            col = data.iloc[:, indices[key]].astype(str).str.strip().replace('nan', default)
             return col.fillna(default)
-        
-        country_col = safe_str_extract(indices['country'], '')
-        port_col = safe_str_extract(indices['port'], '')
-        # For Unit, use 'N/A' as default instead of empty string
-        unit_col = safe_str_extract(indices['unit'], 'N/A')
-        
-        # Vectorized parsing of numeric columns
-        def safe_numeric_extract(col_idx):
-            if col_idx is None:
-                return pd.Series([None] * len(data_df), index=data_df.index, dtype='float64')
-            col = data_df.iloc[:, col_idx]
-            return parse_numeric_series(col)
-        
-        qty_col = safe_numeric_extract(indices['qty'])
-        inr_col = safe_numeric_extract(indices['inr'])
-        usd_col = safe_numeric_extract(indices['usd'])
-        
-        # Convert data_type to proper format
-        import_export = 'Import' if data_type == 'import' else 'Export'
-        type_col = pd.Series([import_export] * len(data_df), index=data_df.index)
-        year_col = pd.Series([year] * len(data_df), index=data_df.index, dtype='int32')
-        month_col = pd.Series([month] * len(data_df), index=data_df.index, dtype='int32')
-        
-        # Create DataFrame directly from Series (much faster than row-by-row)
-        result_df = pd.DataFrame({
-            'Commodity': commodity_col,
-            'Country': country_col,
-            'Port': port_col,
-            'Year': year_col,
-            'Month': month_col,
-            'Type': type_col,
-            'Quantity': qty_col,
-            'Unit': unit_col,
-            'INR Value': inr_col,
-            'USD Value': usd_col
+
+        def numeric(key):
+            if indices[key] is None:
+                return pd.Series([None] * len(data), index=data.index, dtype='float64')
+            return pd.to_numeric(data.iloc[:, indices[key]], errors='coerce')
+
+        result = pd.DataFrame({
+            'Commodity': commodity,
+            'Country': text('country'),
+            'Port': text('port'),
+            'Year': year,
+            'Month': month,
+            'Type': 'Import' if data_type == 'import' else 'Export',
+            'Quantity': numeric('qty'),
+            'Unit': text('unit', 'N/A'),
+            'INR Value': numeric('inr'),
+            'USD Value': numeric('usd'),
         })
-        
-        # Convert to Polars with proper schema
-        return pl.from_pandas(result_df, schema_overrides={
+
+        return pl.from_pandas(result, schema_overrides={
             'Year': pl.Int32,
             'Month': pl.Int32,
             'Quantity': pl.Int64,
             'INR Value': pl.Int64,
-            'USD Value': pl.Int64
+            'USD Value': pl.Int64,
         })
-    
+
     except Exception as e:
         logger.error(f"Error parsing XLS file: {e}")
-        import traceback
         logger.debug(traceback.format_exc())
         return pl.DataFrame()
 
 
 def extract_path_info(zip_path):
     """
-    Extract year, month, and data type from zip file path.
-    Handles both old structure (raw/$year/$month.zip) and new structure (raw/import|export/$year/$month.zip).
-    
-    Args:
-        zip_path: Path to the zip file
-    
-    Returns:
-        tuple: (year, month, data_type) or (None, None, None) if extraction fails
+    Extract (year, month, data_type) from a zip file path. Handles both
+    raw/$year/$month.zip (assumed import) and raw/import|export/$year/$month.zip.
     """
-    path_parts = zip_path.parts
-    year = None
-    month = None
-    data_type = None
-    
-    for part in path_parts:
-        if part in ['import', 'export']:
+    year = month = data_type = None
+    for part in zip_path.parts:
+        if part in ('import', 'export'):
             data_type = part
-        elif part.isdigit() and len(part) == 4:  # Year
+        elif part.isdigit() and len(part) == 4:
             year = int(part)
-        elif part.endswith('.zip'):
-            month_str = part.replace('.zip', '')
-            if month_str.isdigit():
-                month = int(month_str)
-    
-    # Handle old directory structure: raw/$year/$month.zip (assume import)
+        elif part.endswith('.zip') and part[:-4].isdigit():
+            month = int(part[:-4])
+
     if year is not None and month is not None and data_type is None:
         data_type = 'import'  # Old structure files are import data
         logger.debug(f"Old directory structure detected for {zip_path}, assuming import data")
-    
+
     return year, month, data_type
 
 
 def process_zip_file(zip_path):
-    """
-    Process a single zip file and extract all XLS files.
-    Optimized for performance with vectorized operations.
-    
-    Args:
-        zip_path: Path to the zip file (can be Path object or string)
-    
-    Returns:
-        Polars DataFrame with all data from the zip file
-    """
-    zip_path = Path(zip_path) if not isinstance(zip_path, Path) else zip_path
+    """Process a single zip file and return a Polars DataFrame of all its XLS data."""
+    zip_path = Path(zip_path)
     year, month, data_type = extract_path_info(zip_path)
-    
-    if year is None or month is None or data_type is None:
+    if None in (year, month, data_type):
         logger.warning(f"Could not extract year/month/type from path: {zip_path}")
         return pl.DataFrame()
-    
-    all_data = []
-    
+
+    frames = []
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
-            # Filter XLS files more efficiently
-            xls_files = [f for f in z.namelist() if f.lower().endswith(('.xls', '.xlsx'))]
-            
-            if not xls_files:
-                return pl.DataFrame()
-            
-            for xls_file in xls_files:
-                try:
-                    xls_data = z.read(xls_file)
-                    df = parse_xls_file(xls_data, year, month, data_type)
-                    
-                    if not df.is_empty():
-                        all_data.append(df)
-                
-                except Exception as e:
-                    logger.error(f"Error processing {xls_file} in {zip_path}: {e}")
+            for name in z.namelist():
+                if not name.lower().endswith(('.xls', '.xlsx')):
                     continue
-        
-        if all_data:
-            # Use Polars concat for efficient combining
-            combined_df = pl.concat(all_data)
-            return combined_df
-        else:
-            return pl.DataFrame()
-    
+                try:
+                    df = parse_xls_file(z.read(name), year, month, data_type)
+                    if not df.is_empty():
+                        frames.append(df)
+                except Exception as e:
+                    logger.error(f"Error processing {name} in {zip_path}: {e}")
     except Exception as e:
         logger.error(f"Error processing zip file {zip_path}: {e}")
         return pl.DataFrame()
 
+    return pl.concat(frames) if frames else pl.DataFrame()
+
 
 def clean_data(df):
-    """
-    Clean and standardize the combined DataFrame using optimized Polars operations.
-    
-    Args:
-        df: Polars DataFrame
-    
-    Returns:
-        Polars DataFrame: Cleaned DataFrame
-    """
-    # Combine all cleaning operations in a single pass where possible
-    # Remove duplicates first (most efficient to do early)
-    df = df.unique()
-    
-    # Ensure proper data types and clean in one pass
-    df = df.with_columns([
+    """Clean and standardize the combined DataFrame."""
+    df = df.unique().with_columns(
         pl.col('Year').cast(pl.Int32, strict=False),
         pl.col('Month').cast(pl.Int32, strict=False),
         pl.col('Quantity').cast(pl.Int64, strict=False),
         pl.col('INR Value').cast(pl.Int64, strict=False),
         pl.col('USD Value').cast(pl.Int64, strict=False),
-        # Set blank Unit values to "N/A" in the same pass
-        # Also handle 'nan' strings that might come from pandas conversion
         pl.when(
-            pl.col('Unit').is_null() | 
-            (pl.col('Unit').str.strip_chars() == '') |
-            (pl.col('Unit').str.to_lowercase() == 'nan')
+            pl.col('Unit').is_null()
+            | (pl.col('Unit').str.strip_chars() == '')
+            | (pl.col('Unit').str.to_lowercase() == 'nan')
         )
         .then(pl.lit('N/A'))
         .otherwise(pl.col('Unit'))
-        .alias('Unit')
-    ])
-    
-    # Filter out rows where Quantity, INR Value, and USD Value are all 0
-    df = df.filter(
-        ~((pl.col('Quantity').fill_null(0) == 0) & 
-          (pl.col('INR Value').fill_null(0) == 0) & 
-          (pl.col('USD Value').fill_null(0) == 0))
+        .alias('Unit'),
     )
-    
-    # Sort by Commodity, Country, Port, Year, Month, Type
-    df = df.sort(['Commodity', 'Country', 'Port', 'Year', 'Month', 'Type'])
-    
-    return df
+
+    # Drop rows where Quantity, INR Value and USD Value are all zero/null
+    df = df.filter(
+        ~(
+            (pl.col('Quantity').fill_null(0) == 0)
+            & (pl.col('INR Value').fill_null(0) == 0)
+            & (pl.col('USD Value').fill_null(0) == 0)
+        )
+    )
+
+    return df.sort(SORT_KEYS)
 
 
-def save_output_files(df, data_dir):
+def save_output_files(lf, data_dir):
     """
-    Save the DataFrame to Parquet and CSV formats.
-    Optimized to write CSV directly to zip without intermediate file.
-    
-    Args:
-        df: Polars DataFrame
-        data_dir: Path to data directory
+    Stream a sorted LazyFrame to Parquet and CSV, keeping the full dataset
+    out of memory. Parquet is written to a temp file then atomically replaced,
+    so a dataset scanned inside `lf` is never read and written at once.
     """
-    # Save as Parquet
     parquet_path = data_dir / "export-import.parquet"
-    logger.info(f"Saving Parquet file to {parquet_path}...")
-    df.write_parquet(parquet_path, compression='zstd')
+    tmp_parquet = parquet_path.with_name(parquet_path.name + ".tmp")
+    logger.info(f"Streaming Parquet file to {parquet_path}...")
+    lf.sink_parquet(tmp_parquet, compression='zstd', engine='streaming')
+    tmp_parquet.replace(parquet_path)
     logger.info(f"Saved Parquet file: {parquet_path}")
-    
-    # Save CSV directly to zip file (more efficient)
+
+    # Stream CSV from the freshly written (already sorted) Parquet, then compress
     csv_zip_path = data_dir / "export-import.csv.zip"
-    logger.info(f"Creating CSV zip file at {csv_zip_path}...")
-    
-    # Write CSV to BytesIO buffer, then add to zip
-    csv_buffer = BytesIO()
-    df.write_csv(csv_buffer)
-    csv_buffer.seek(0)
-    
-    with zipfile.ZipFile(csv_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.writestr("export-import.csv", csv_buffer.getvalue())
-    
+    tmp_csv = data_dir / "export-import.csv"
+    logger.info(f"Streaming CSV and compressing to {csv_zip_path}...")
+    pl.scan_parquet(parquet_path).sink_csv(tmp_csv, engine='streaming')
+    try:
+        with zipfile.ZipFile(csv_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            z.write(tmp_csv, arcname="export-import.csv")
+    finally:
+        tmp_csv.unlink(missing_ok=True)
     logger.info(f"Saved CSV zip file: {csv_zip_path}")
 
 
 def process_zip_file_wrapper(zip_file):
-    """Wrapper function for multiprocessing."""
+    """Wrapper for multiprocessing that never propagates exceptions."""
     try:
         return process_zip_file(zip_file)
     except Exception as e:
@@ -426,75 +279,73 @@ def process_zip_file_wrapper(zip_file):
         return pl.DataFrame()
 
 
+def parse_zip_files(zip_files):
+    """Process zip files (in parallel when worthwhile) with a progress bar."""
+    num_workers = min(cpu_count(), len(zip_files), 8)
+    desc = dict(desc="Processing zip files", unit="file")
+
+    if num_workers > 1:
+        with Pool(processes=num_workers) as pool:
+            results = list(tqdm(pool.imap(process_zip_file_wrapper, zip_files),
+                                total=len(zip_files), **desc))
+    else:
+        results = [process_zip_file(z) for z in tqdm(zip_files, **desc)]
+
+    return [df for df in results if not df.is_empty()]
+
+
 def main():
-    """Main function to process all zip files and create output files with parallel processing."""
+    """Process all new zip files and (re)build the Parquet and CSV outputs."""
     raw_dir = Path("raw")
     data_dir = Path("data")
-    
+
     if not raw_dir.exists():
         logger.error(f"Raw directory {raw_dir} does not exist")
         return
-    
-    # Create data directory if it doesn't exist
+
     data_dir.mkdir(exist_ok=True)
-    
-    # Find all zip files recursively
+    parquet_path = data_dir / "export-import.parquet"
+    latest = get_latest_parquet_month(parquet_path)
+
     zip_files = sorted(raw_dir.rglob("*.zip"))
-    
     if not zip_files:
         logger.warning("No zip files found in raw/ directory")
         return
-    
-    # Determine number of workers (use CPU count but cap at reasonable number)
-    num_workers = min(cpu_count(), len(zip_files), 8)  # Cap at 8 to avoid too many processes
-    
-    if num_workers > 1:
-        # Process zip files in parallel with progress bar
-        with Pool(processes=num_workers) as pool:
-            # Use imap for progress tracking in parallel processing
-            results = list(tqdm(
-                pool.imap(process_zip_file_wrapper, zip_files),
-                total=len(zip_files),
-                desc="Processing zip files",
-                unit="file"
-            ))
-        
-        # Filter out empty DataFrames
-        all_dataframes = [df for df in results if not df.is_empty()]
-    else:
-        # Process sequentially if only one worker with progress bar
-        all_dataframes = []
-        for zip_file in tqdm(zip_files, desc="Processing zip files", unit="file"):
-            df = process_zip_file(zip_file)
-            if not df.is_empty():
-                all_dataframes.append(df)
-    
+
+    # Only process months following the most recent month already in the dataset
+    if latest is not None:
+        logger.info(f"Most recent month in dataset: {latest[0]}-{latest[1]:02d}")
+
+        def is_new_month(zip_path):
+            year, month, _ = extract_path_info(zip_path)
+            return None not in (year, month) and (year, month) > latest
+
+        zip_files = [z for z in zip_files if is_new_month(z)]
+        if not zip_files:
+            logger.info("No new zip files to process; dataset is already up to date")
+            return
+        logger.info(f"Processing {len(zip_files)} zip files for months after {latest[0]}-{latest[1]:02d}")
+
+    all_dataframes = parse_zip_files(zip_files)
     if not all_dataframes:
         logger.error("No data was extracted from any zip files")
         return
-    
-    # Combine all data using Polars concat (very efficient)
-    combined_df = pl.concat(all_dataframes)
-    
-    # Clean and standardize the data
-    combined_df = clean_data(combined_df)
-    
-    logger.info(f"Final dataset: {len(combined_df)} rows, {len(combined_df.columns)} columns")
-    
-    # Get date range efficiently using a single aggregation
-    date_stats = combined_df.select([
-        pl.min('Year').alias('year_min'),
-        pl.max('Year').alias('year_max')
-    ]).row(0)
-    
-    year_min, year_max = date_stats
-    month_min = combined_df.filter(pl.col('Year') == year_min)['Month'].min()
-    month_max = combined_df.filter(pl.col('Year') == year_max)['Month'].max()
-    logger.info(f"Date range: {year_min}-{month_min:02d} to {year_max}-{month_max:02d}")
-    
-    # Save output files
-    save_output_files(combined_df, data_dir)
-    
+
+    # Combine and clean the newly parsed data (bounded: only new months)
+    new_df = clean_data(pl.concat(all_dataframes))
+    logger.info(f"Parsed {len(new_df)} new rows across {len(zip_files)} zip files")
+
+    # Append new rows to any existing dataset and re-sort out-of-core via streaming
+    if latest is not None and parquet_path.exists():
+        output_lf = pl.concat([pl.scan_parquet(parquet_path), new_df.lazy()]).sort(SORT_KEYS)
+    else:
+        output_lf = new_df.lazy()
+
+    save_output_files(output_lf, data_dir)
+
+    # Report the final size cheaply from Parquet metadata (no full scan)
+    total_rows = pl.scan_parquet(parquet_path).select(pl.len()).collect().item()
+    logger.info(f"Final dataset: {total_rows} rows")
     logger.info("Parsing complete!")
 
 
